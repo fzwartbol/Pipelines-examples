@@ -3,12 +3,14 @@ kind: Pipeline
 metadata:
   name: update-configmap-tag-pipeline
   labels:
-    app.kubernetes.io/version: "0.1"
+    app.kubernetes.io/version: "0.2"
   annotations:
     tekton.dev/displayName: "Update ConfigMap Tag"
     tekton.dev/description: >-
       Fetches the latest tag from a deploy repository, updates a ConfigMap in a
-      target repository, and sends a Mattermost notification with the outcome.
+      feature branch of a forked target repository, opens a Bitbucket PR against
+      the upstream develop branch, and sends a Mattermost notification with the
+      outcome.
 spec:
   params:
     # ── deploy repo ──────────────────────────────────────────────────────────
@@ -22,16 +24,41 @@ spec:
         Name of the deploy repository. Used as the key in the ConfigMap
         (e.g. "my-app" → data.my-app: v1.2.3).
 
-    # ── target repo ──────────────────────────────────────────────────────────
+    # ── target repo (fork) ───────────────────────────────────────────────────
     - name: target-repo-url
       type: string
-      description: Git URL of the target repository that contains the ConfigMap.
+      description: Git clone URL of the forked target repository.
 
-    - name: target-repo-branch
+    # ── bitbucket ────────────────────────────────────────────────────────────
+    - name: bitbucket-api-url
       type: string
-      default: main
-      description: Branch in the target repository to check out and push to.
+      default: "https://api.bitbucket.org/2.0"
+      description: Base URL of the Bitbucket API.
 
+    - name: bitbucket-fork-workspace
+      type: string
+      description: Bitbucket workspace (user or team slug) that owns the fork.
+
+    - name: bitbucket-fork-repo-slug
+      type: string
+      description: Bitbucket repository slug of the fork.
+
+    - name: bitbucket-upstream-workspace
+      type: string
+      description: Bitbucket workspace of the upstream (original) repository.
+
+    - name: bitbucket-upstream-repo-slug
+      type: string
+      description: Bitbucket repository slug of the upstream repository.
+
+    - name: bitbucket-target-branch
+      type: string
+      default: develop
+      description: >-
+        Branch in the upstream repository to target for the PR.
+        The feature branch is also created from this branch in the fork.
+
+    # ── configmap ────────────────────────────────────────────────────────────
     - name: configmap-name
       type: string
       description: Name of the ConfigMap resource to update.
@@ -41,12 +68,6 @@ spec:
       description: >-
         Relative path within the target repository to the ConfigMap YAML file
         (e.g. "k8s/versions-configmap.yaml").
-
-    - name: target-bitbucket-pr-url
-      type: string
-      description: >-
-        URL of the Bitbucket pull request in the target repository.
-        Included in the Mattermost notification message.
 
     # ── git identity ─────────────────────────────────────────────────────────
     - name: git-user-name
@@ -66,14 +87,22 @@ spec:
 
   workspaces:
     - name: ssh-credentials
-      description: >-
-        Secret containing the SSH private key for git operations.
+      description: Secret containing the SSH private key for git operations.
       optional: true
+
+    - name: bitbucket-credentials
+      description: >-
+        Secret containing Bitbucket authentication credentials.
+        Expected keys: "username" and "app-password".
 
   results:
     - name: tag
       description: The latest tag resolved from the deploy repository.
       value: $(tasks.update-configmap-tag.results.tag)
+
+    - name: pr-url
+      description: URL of the Bitbucket pull request.
+      value: $(tasks.update-configmap-tag.results.pr-url)
 
   tasks:
     - name: update-configmap-tag
@@ -86,8 +115,18 @@ spec:
           value: $(params.deploy-repo-name)
         - name: target-repo-url
           value: $(params.target-repo-url)
-        - name: target-repo-branch
-          value: $(params.target-repo-branch)
+        - name: bitbucket-api-url
+          value: $(params.bitbucket-api-url)
+        - name: bitbucket-fork-workspace
+          value: $(params.bitbucket-fork-workspace)
+        - name: bitbucket-fork-repo-slug
+          value: $(params.bitbucket-fork-repo-slug)
+        - name: bitbucket-upstream-workspace
+          value: $(params.bitbucket-upstream-workspace)
+        - name: bitbucket-upstream-repo-slug
+          value: $(params.bitbucket-upstream-repo-slug)
+        - name: bitbucket-target-branch
+          value: $(params.bitbucket-target-branch)
         - name: configmap-name
           value: $(params.configmap-name)
         - name: configmap-path
@@ -99,6 +138,8 @@ spec:
       workspaces:
         - name: ssh-credentials
           workspace: ssh-credentials
+        - name: bitbucket-credentials
+          workspace: bitbucket-credentials
 
   finally:
     - name: notify-mattermost
@@ -114,4 +155,4 @@ spec:
             - **Deploy repo:** $(params.deploy-repo-url)
             - **Tag:** $(tasks.update-configmap-tag.results.tag)
             - **ConfigMap key:** `$(params.deploy-repo-name)`
-            - **Target PR:** $(params.target-bitbucket-pr-url)
+            - **Pull request:** $(tasks.update-configmap-tag.results.pr-url)

@@ -3,15 +3,16 @@ kind: Task
 metadata:
   name: update-configmap-tag
   labels:
-    app.kubernetes.io/version: "0.1"
+    app.kubernetes.io/version: "0.2"
   annotations:
     tekton.dev/displayName: "Update ConfigMap Tag"
     tekton.dev/description: >-
-      Fetches the latest git tag from a deploy repository and updates a
-      ConfigMap in a target repository. The ConfigMap entry uses the deploy
-      repository name as the key and the resolved tag as the value.
+      Fetches the latest tag from a deploy repository, updates a ConfigMap key
+      in a feature branch of a forked target repository, and opens a pull
+      request against the upstream repository's target branch.
 spec:
   params:
+    # ── deploy repo ──────────────────────────────────────────────────────────
     - name: deploy-repo-url
       type: string
       description: Git URL of the deploy repository to read the latest tag from.
@@ -22,18 +23,44 @@ spec:
         Name of the deploy repository. Used as the key in the ConfigMap
         (e.g. "my-app" → data.my-app: v1.2.3).
 
+    # ── target repo (fork) ───────────────────────────────────────────────────
     - name: target-repo-url
       type: string
-      description: Git URL of the target repository that contains the ConfigMap.
+      description: Git clone URL of the forked target repository.
 
-    - name: target-repo-branch
+    # ── bitbucket ────────────────────────────────────────────────────────────
+    - name: bitbucket-api-url
       type: string
-      default: main
-      description: Branch in the target repository to check out and push to.
+      default: "https://api.bitbucket.org/2.0"
+      description: Base URL of the Bitbucket API.
 
+    - name: bitbucket-fork-workspace
+      type: string
+      description: Bitbucket workspace (user or team slug) that owns the fork.
+
+    - name: bitbucket-fork-repo-slug
+      type: string
+      description: Bitbucket repository slug of the fork.
+
+    - name: bitbucket-upstream-workspace
+      type: string
+      description: Bitbucket workspace of the upstream (original) repository.
+
+    - name: bitbucket-upstream-repo-slug
+      type: string
+      description: Bitbucket repository slug of the upstream repository.
+
+    - name: bitbucket-target-branch
+      type: string
+      default: develop
+      description: >-
+        Branch in the upstream repository to target for the PR.
+        The feature branch is also created from this branch in the fork.
+
+    # ── configmap ────────────────────────────────────────────────────────────
     - name: configmap-name
       type: string
-      description: Name of the ConfigMap to update inside the target repository.
+      description: Name of the ConfigMap resource to update.
 
     - name: configmap-path
       type: string
@@ -41,6 +68,7 @@ spec:
         Relative path within the target repository to the ConfigMap YAML file
         (e.g. "k8s/versions-configmap.yaml").
 
+    # ── git identity ─────────────────────────────────────────────────────────
     - name: git-user-name
       type: string
       default: "Tekton Bot"
@@ -54,14 +82,21 @@ spec:
   workspaces:
     - name: ssh-credentials
       description: >-
-        Secret containing the SSH private key for authenticating git operations.
-        Mount a Kubernetes Secret with key "id_rsa" (or configure
-        GIT_SSH_COMMAND to point at the key path).
+        Secret containing the SSH private key for git operations.
+        Mount a Kubernetes Secret with key "id_rsa".
       optional: true
+
+    - name: bitbucket-credentials
+      description: >-
+        Secret containing Bitbucket authentication credentials.
+        Expected keys: "username" and "app-password".
 
   results:
     - name: tag
       description: The latest tag resolved from the deploy repository.
+
+    - name: pr-url
+      description: URL of the Bitbucket pull request created in the upstream repository.
 
   stepTemplate:
     image: alpine/git:2.43.0
@@ -72,8 +107,6 @@ spec:
         value: $(params.deploy-repo-name)
       - name: TARGET_REPO_URL
         value: $(params.target-repo-url)
-      - name: TARGET_REPO_BRANCH
-        value: $(params.target-repo-branch)
       - name: CONFIGMAP_NAME
         value: $(params.configmap-name)
       - name: CONFIGMAP_PATH
@@ -82,12 +115,24 @@ spec:
         value: $(params.git-user-name)
       - name: GIT_USER_EMAIL
         value: $(params.git-user-email)
+      - name: BITBUCKET_API_URL
+        value: $(params.bitbucket-api-url)
+      - name: BITBUCKET_FORK_WORKSPACE
+        value: $(params.bitbucket-fork-workspace)
+      - name: BITBUCKET_FORK_REPO_SLUG
+        value: $(params.bitbucket-fork-repo-slug)
+      - name: BITBUCKET_UPSTREAM_WORKSPACE
+        value: $(params.bitbucket-upstream-workspace)
+      - name: BITBUCKET_UPSTREAM_REPO_SLUG
+        value: $(params.bitbucket-upstream-repo-slug)
+      - name: BITBUCKET_TARGET_BRANCH
+        value: $(params.bitbucket-target-branch)
 
   steps:
     # -------------------------------------------------------------------------
     # Step 1: resolve-tag
-    # Clone the deploy repo (shallow, tags only) and determine the latest tag.
-    # The tag is written to /workspace/tag so later steps can consume it.
+    # Shallow-clone the deploy repo, fetch all tags, and write the latest tag
+    # to /workspace/tag for subsequent steps.
     # -------------------------------------------------------------------------
     - name: resolve-tag
       workingDir: /workspace
@@ -102,7 +147,7 @@ spec:
           --no-tags \
           "${DEPLOY_REPO_URL}" deploy-repo
 
-        # Fetch all tags explicitly (shallow clone skips them by default).
+        # Fetch all tags explicitly — shallow clone skips them by default.
         git -C deploy-repo fetch --tags --depth 1
 
         LATEST_TAG=$(git -C deploy-repo describe --tags \
@@ -119,8 +164,9 @@ spec:
 
     # -------------------------------------------------------------------------
     # Step 2: update-configmap
-    # Clone the target repo, patch the ConfigMap key for this deploy repo,
-    # and push the change on the configured branch.
+    # Clone the fork on the target branch, create a feature branch, patch the
+    # ConfigMap key, and force-push. Writes the feature branch name to
+    # /workspace/feature-branch. Sets /workspace/skip-pr if no change is made.
     # -------------------------------------------------------------------------
     - name: update-configmap
       workingDir: /workspace
@@ -130,48 +176,47 @@ spec:
 
         LATEST_TAG=$(cat /workspace/tag)
 
-        echo "Cloning target repo: ${TARGET_REPO_URL} (branch: ${TARGET_REPO_BRANCH})"
+        # Sanitize tag for use in a branch name.
+        SAFE_TAG=$(echo "${LATEST_TAG}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+        FEATURE_BRANCH="tekton/update-${DEPLOY_REPO_NAME}-to-${SAFE_TAG}"
+
+        echo "Cloning fork: ${TARGET_REPO_URL} (base: ${BITBUCKET_TARGET_BRANCH})"
         git clone \
-          --branch "${TARGET_REPO_BRANCH}" \
+          --branch "${BITBUCKET_TARGET_BRANCH}" \
           --single-branch \
           "${TARGET_REPO_URL}" target-repo
 
-        FULL_PATH="target-repo/${CONFIGMAP_PATH}"
+        cd target-repo
 
-        if [ ! -f "${FULL_PATH}" ]; then
+        git checkout -b "${FEATURE_BRANCH}"
+
+        if [ ! -f "${CONFIGMAP_PATH}" ]; then
           echo "ERROR: ConfigMap file not found at ${CONFIGMAP_PATH}" >&2
           exit 1
         fi
 
         echo "Updating key '${DEPLOY_REPO_NAME}' to '${LATEST_TAG}' in ${CONFIGMAP_PATH}"
 
-        # Use awk to rewrite the matching key under the 'data:' section.
-        # Handles both "  key: old-value" and "  key: 'old-value'" formats.
         awk -v key="${DEPLOY_REPO_NAME}" -v tag="${LATEST_TAG}" '
           /^data:/ { in_data=1 }
           in_data && $0 ~ "^[[:space:]]+" key ":" {
-            # Preserve leading whitespace, rewrite value.
             match($0, /^([[:space:]]+)/, arr)
             print arr[1] key ": " tag
             next
           }
           { print }
-        ' "${FULL_PATH}" > "${FULL_PATH}.tmp"
+        ' "${CONFIGMAP_PATH}" > "${CONFIGMAP_PATH}.tmp"
+        mv "${CONFIGMAP_PATH}.tmp" "${CONFIGMAP_PATH}"
 
-        mv "${FULL_PATH}.tmp" "${FULL_PATH}"
-
-        # Verify the key was actually updated; add it if it was missing.
-        if ! grep -q "^[[:space:]]*${DEPLOY_REPO_NAME}:" "${FULL_PATH}"; then
-          echo "Key '${DEPLOY_REPO_NAME}' not found — appending it to data section."
-          # Insert after the 'data:' line.
+        # Append the key if it was not found under data:.
+        if ! grep -q "^[[:space:]]*${DEPLOY_REPO_NAME}:" "${CONFIGMAP_PATH}"; then
+          echo "Key '${DEPLOY_REPO_NAME}' not found — appending to data section."
           awk -v key="${DEPLOY_REPO_NAME}" -v tag="${LATEST_TAG}" '
             /^data:/ { print; print "  " key ": " tag; next }
             { print }
-          ' "${FULL_PATH}" > "${FULL_PATH}.tmp"
-          mv "${FULL_PATH}.tmp" "${FULL_PATH}"
+          ' "${CONFIGMAP_PATH}" > "${CONFIGMAP_PATH}.tmp"
+          mv "${CONFIGMAP_PATH}.tmp" "${CONFIGMAP_PATH}"
         fi
-
-        cd target-repo
 
         git config user.name  "${GIT_USER_NAME}"
         git config user.email "${GIT_USER_EMAIL}"
@@ -179,11 +224,93 @@ spec:
         git add "${CONFIGMAP_PATH}"
 
         if git diff --cached --quiet; then
-          echo "ConfigMap already up-to-date — no commit needed."
+          echo "ConfigMap already up-to-date — skipping commit and PR."
+          touch /workspace/skip-pr
           exit 0
         fi
 
         git commit -m "chore: update ${DEPLOY_REPO_NAME} tag to ${LATEST_TAG} in ${CONFIGMAP_NAME}"
-        git push origin "${TARGET_REPO_BRANCH}"
+        git push --force origin "${FEATURE_BRANCH}"
 
-        echo "Successfully pushed tag update to ${TARGET_REPO_URL}"
+        echo -n "${FEATURE_BRANCH}" > /workspace/feature-branch
+        echo "Pushed feature branch: ${FEATURE_BRANCH}"
+
+    # -------------------------------------------------------------------------
+    # Step 3: create-bitbucket-pr
+    # Call the Bitbucket REST API to open a PR from the fork's feature branch
+    # to the upstream repository's target branch. If a PR already exists for
+    # this branch, the existing PR URL is used instead.
+    # -------------------------------------------------------------------------
+    - name: create-bitbucket-pr
+      image: alpine:3.19
+      workingDir: /workspace
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+
+        if [ -f /workspace/skip-pr ]; then
+          echo "No ConfigMap change detected — skipping PR creation."
+          echo -n "" > $(results.pr-url.path)
+          exit 0
+        fi
+
+        apk add --no-cache curl jq > /dev/null 2>&1
+
+        LATEST_TAG=$(cat /workspace/tag)
+        FEATURE_BRANCH=$(cat /workspace/feature-branch)
+        BB_USER=$(cat /workspace/bitbucket-credentials/username)
+        BB_PASS=$(cat /workspace/bitbucket-credentials/app-password)
+
+        PR_TITLE="chore: update ${DEPLOY_REPO_NAME} to ${LATEST_TAG}"
+        PR_DESC="Automated tag update by Tekton pipeline.\n\n**Deploy repo:** ${DEPLOY_REPO_URL}\n**Tag:** \`${LATEST_TAG}\`"
+
+        PR_BODY=$(jq -n \
+          --arg title    "${PR_TITLE}" \
+          --arg desc     "${PR_DESC}" \
+          --arg branch   "${FEATURE_BRANCH}" \
+          --arg fork     "${BITBUCKET_FORK_WORKSPACE}/${BITBUCKET_FORK_REPO_SLUG}" \
+          --arg target   "${BITBUCKET_TARGET_BRANCH}" \
+          '{
+            title: $title,
+            description: $desc,
+            source: {
+              branch: { name: $branch },
+              repository: { full_name: $fork }
+            },
+            destination: {
+              branch: { name: $target }
+            },
+            close_source_branch: true
+          }')
+
+        RESPONSE=$(curl -s -w "\n%{http_code}" \
+          -X POST \
+          "${BITBUCKET_API_URL}/repositories/${BITBUCKET_UPSTREAM_WORKSPACE}/${BITBUCKET_UPSTREAM_REPO_SLUG}/pullrequests" \
+          -u "${BB_USER}:${BB_PASS}" \
+          -H "Content-Type: application/json" \
+          -d "${PR_BODY}")
+
+        HTTP_CODE=$(printf '%s' "${RESPONSE}" | tail -1)
+        BODY=$(printf '%s' "${RESPONSE}" | head -n -1)
+
+        if [ "${HTTP_CODE}" = "201" ]; then
+          PR_URL=$(printf '%s' "${BODY}" | jq -r '.links.html.href')
+          echo "Created PR: ${PR_URL}"
+
+        elif [ "${HTTP_CODE}" = "409" ]; then
+          # PR already exists for this branch — fetch its URL.
+          echo "PR already exists for branch '${FEATURE_BRANCH}', fetching existing PR URL."
+          ENCODED_BRANCH=$(printf '%s' "${FEATURE_BRANCH}" | jq -Rr @uri)
+          SEARCH=$(curl -s \
+            "${BITBUCKET_API_URL}/repositories/${BITBUCKET_UPSTREAM_WORKSPACE}/${BITBUCKET_UPSTREAM_REPO_SLUG}/pullrequests?q=source.branch.name%3D%22${ENCODED_BRANCH}%22%20AND%20state%3D%22OPEN%22" \
+            -u "${BB_USER}:${BB_PASS}")
+          PR_URL=$(printf '%s' "${SEARCH}" | jq -r '.values[0].links.html.href')
+          echo "Existing PR: ${PR_URL}"
+
+        else
+          echo "ERROR: Bitbucket API returned HTTP ${HTTP_CODE}:" >&2
+          printf '%s\n' "${BODY}" >&2
+          exit 1
+        fi
+
+        echo -n "${PR_URL}" > $(results.pr-url.path)
