@@ -1,0 +1,117 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: update-configmap-tag-pipeline
+  labels:
+    app.kubernetes.io/version: "0.1"
+  annotations:
+    tekton.dev/displayName: "Update ConfigMap Tag"
+    tekton.dev/description: >-
+      Fetches the latest tag from a deploy repository, updates a ConfigMap in a
+      target repository, and sends a Mattermost notification with the outcome.
+spec:
+  params:
+    # ── deploy repo ──────────────────────────────────────────────────────────
+    - name: deploy-repo-url
+      type: string
+      description: Git URL of the deploy repository to read the latest tag from.
+
+    - name: deploy-repo-name
+      type: string
+      description: >-
+        Name of the deploy repository. Used as the key in the ConfigMap
+        (e.g. "my-app" → data.my-app: v1.2.3).
+
+    # ── target repo ──────────────────────────────────────────────────────────
+    - name: target-repo-url
+      type: string
+      description: Git URL of the target repository that contains the ConfigMap.
+
+    - name: target-repo-branch
+      type: string
+      default: main
+      description: Branch in the target repository to check out and push to.
+
+    - name: configmap-name
+      type: string
+      description: Name of the ConfigMap resource to update.
+
+    - name: configmap-path
+      type: string
+      description: >-
+        Relative path within the target repository to the ConfigMap YAML file
+        (e.g. "k8s/versions-configmap.yaml").
+
+    - name: target-bitbucket-pr-url
+      type: string
+      description: >-
+        URL of the Bitbucket pull request in the target repository.
+        Included in the Mattermost notification message.
+
+    # ── git identity ─────────────────────────────────────────────────────────
+    - name: git-user-name
+      type: string
+      default: "Tekton Bot"
+      description: Git author name used for the commit.
+
+    - name: git-user-email
+      type: string
+      default: "tekton-bot@example.com"
+      description: Git author e-mail used for the commit.
+
+    # ── mattermost ───────────────────────────────────────────────────────────
+    - name: mattermost-channel
+      type: string
+      description: Mattermost channel to post the notification to.
+
+  workspaces:
+    - name: ssh-credentials
+      description: >-
+        Secret containing the SSH private key for git operations.
+      optional: true
+
+  results:
+    - name: tag
+      description: The latest tag resolved from the deploy repository.
+      value: $(tasks.update-configmap-tag.results.tag)
+
+  tasks:
+    - name: update-configmap-tag
+      taskRef:
+        name: update-configmap-tag
+      params:
+        - name: deploy-repo-url
+          value: $(params.deploy-repo-url)
+        - name: deploy-repo-name
+          value: $(params.deploy-repo-name)
+        - name: target-repo-url
+          value: $(params.target-repo-url)
+        - name: target-repo-branch
+          value: $(params.target-repo-branch)
+        - name: configmap-name
+          value: $(params.configmap-name)
+        - name: configmap-path
+          value: $(params.configmap-path)
+        - name: git-user-name
+          value: $(params.git-user-name)
+        - name: git-user-email
+          value: $(params.git-user-email)
+      workspaces:
+        - name: ssh-credentials
+          workspace: ssh-credentials
+
+  finally:
+    - name: notify-mattermost
+      taskRef:
+        name: mattermost-notify
+      params:
+        - name: channel
+          value: $(params.mattermost-channel)
+        - name: message
+          value: |
+            **ConfigMap tag update — $(tasks.update-configmap-tag.status)**
+
+            - **Deploy repo:** $(params.deploy-repo-url)
+            - **Tag:** $(tasks.update-configmap-tag.results.tag)
+            - **ConfigMap key:** `$(params.deploy-repo-name)`
+            - **Target PR:** $(params.target-bitbucket-pr-url)
