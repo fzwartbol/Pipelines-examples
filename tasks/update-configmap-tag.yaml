@@ -1,0 +1,189 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: update-configmap-tag
+  labels:
+    app.kubernetes.io/version: "0.1"
+  annotations:
+    tekton.dev/displayName: "Update ConfigMap Tag"
+    tekton.dev/description: >-
+      Fetches the latest git tag from a deploy repository and updates a
+      ConfigMap in a target repository. The ConfigMap entry uses the deploy
+      repository name as the key and the resolved tag as the value.
+spec:
+  params:
+    - name: deploy-repo-url
+      type: string
+      description: Git URL of the deploy repository to read the latest tag from.
+
+    - name: deploy-repo-name
+      type: string
+      description: >-
+        Name of the deploy repository. Used as the key in the ConfigMap
+        (e.g. "my-app" → data.my-app: v1.2.3).
+
+    - name: target-repo-url
+      type: string
+      description: Git URL of the target repository that contains the ConfigMap.
+
+    - name: target-repo-branch
+      type: string
+      default: main
+      description: Branch in the target repository to check out and push to.
+
+    - name: configmap-name
+      type: string
+      description: Name of the ConfigMap to update inside the target repository.
+
+    - name: configmap-path
+      type: string
+      description: >-
+        Relative path within the target repository to the ConfigMap YAML file
+        (e.g. "k8s/versions-configmap.yaml").
+
+    - name: git-user-name
+      type: string
+      default: "Tekton Bot"
+      description: Git author name used for the commit.
+
+    - name: git-user-email
+      type: string
+      default: "tekton-bot@example.com"
+      description: Git author e-mail used for the commit.
+
+  workspaces:
+    - name: ssh-credentials
+      description: >-
+        Secret containing the SSH private key for authenticating git operations.
+        Mount a Kubernetes Secret with key "id_rsa" (or configure
+        GIT_SSH_COMMAND to point at the key path).
+      optional: true
+
+  results:
+    - name: tag
+      description: The latest tag resolved from the deploy repository.
+
+  stepTemplate:
+    image: alpine/git:2.43.0
+    env:
+      - name: DEPLOY_REPO_URL
+        value: $(params.deploy-repo-url)
+      - name: DEPLOY_REPO_NAME
+        value: $(params.deploy-repo-name)
+      - name: TARGET_REPO_URL
+        value: $(params.target-repo-url)
+      - name: TARGET_REPO_BRANCH
+        value: $(params.target-repo-branch)
+      - name: CONFIGMAP_NAME
+        value: $(params.configmap-name)
+      - name: CONFIGMAP_PATH
+        value: $(params.configmap-path)
+      - name: GIT_USER_NAME
+        value: $(params.git-user-name)
+      - name: GIT_USER_EMAIL
+        value: $(params.git-user-email)
+
+  steps:
+    # -------------------------------------------------------------------------
+    # Step 1: resolve-tag
+    # Clone the deploy repo (shallow, tags only) and determine the latest tag.
+    # The tag is written to /workspace/tag so later steps can consume it.
+    # -------------------------------------------------------------------------
+    - name: resolve-tag
+      workingDir: /workspace
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+
+        echo "Fetching tags from deploy repo: ${DEPLOY_REPO_URL}"
+
+        git clone \
+          --depth 1 \
+          --no-tags \
+          "${DEPLOY_REPO_URL}" deploy-repo
+
+        # Fetch all tags explicitly (shallow clone skips them by default).
+        git -C deploy-repo fetch --tags --depth 1
+
+        LATEST_TAG=$(git -C deploy-repo describe --tags \
+          "$(git -C deploy-repo rev-list --tags --max-count=1)")
+
+        if [ -z "${LATEST_TAG}" ]; then
+          echo "ERROR: no tags found in ${DEPLOY_REPO_URL}" >&2
+          exit 1
+        fi
+
+        echo "Resolved latest tag: ${LATEST_TAG}"
+        echo -n "${LATEST_TAG}" > /workspace/tag
+        echo -n "${LATEST_TAG}" > $(results.tag.path)
+
+    # -------------------------------------------------------------------------
+    # Step 2: update-configmap
+    # Clone the target repo, patch the ConfigMap key for this deploy repo,
+    # and push the change on the configured branch.
+    # -------------------------------------------------------------------------
+    - name: update-configmap
+      workingDir: /workspace
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+
+        LATEST_TAG=$(cat /workspace/tag)
+
+        echo "Cloning target repo: ${TARGET_REPO_URL} (branch: ${TARGET_REPO_BRANCH})"
+        git clone \
+          --branch "${TARGET_REPO_BRANCH}" \
+          --single-branch \
+          "${TARGET_REPO_URL}" target-repo
+
+        FULL_PATH="target-repo/${CONFIGMAP_PATH}"
+
+        if [ ! -f "${FULL_PATH}" ]; then
+          echo "ERROR: ConfigMap file not found at ${CONFIGMAP_PATH}" >&2
+          exit 1
+        fi
+
+        echo "Updating key '${DEPLOY_REPO_NAME}' to '${LATEST_TAG}' in ${CONFIGMAP_PATH}"
+
+        # Use awk to rewrite the matching key under the 'data:' section.
+        # Handles both "  key: old-value" and "  key: 'old-value'" formats.
+        awk -v key="${DEPLOY_REPO_NAME}" -v tag="${LATEST_TAG}" '
+          /^data:/ { in_data=1 }
+          in_data && $0 ~ "^[[:space:]]+" key ":" {
+            # Preserve leading whitespace, rewrite value.
+            match($0, /^([[:space:]]+)/, arr)
+            print arr[1] key ": " tag
+            next
+          }
+          { print }
+        ' "${FULL_PATH}" > "${FULL_PATH}.tmp"
+
+        mv "${FULL_PATH}.tmp" "${FULL_PATH}"
+
+        # Verify the key was actually updated; add it if it was missing.
+        if ! grep -q "^[[:space:]]*${DEPLOY_REPO_NAME}:" "${FULL_PATH}"; then
+          echo "Key '${DEPLOY_REPO_NAME}' not found — appending it to data section."
+          # Insert after the 'data:' line.
+          awk -v key="${DEPLOY_REPO_NAME}" -v tag="${LATEST_TAG}" '
+            /^data:/ { print; print "  " key ": " tag; next }
+            { print }
+          ' "${FULL_PATH}" > "${FULL_PATH}.tmp"
+          mv "${FULL_PATH}.tmp" "${FULL_PATH}"
+        fi
+
+        cd target-repo
+
+        git config user.name  "${GIT_USER_NAME}"
+        git config user.email "${GIT_USER_EMAIL}"
+
+        git add "${CONFIGMAP_PATH}"
+
+        if git diff --cached --quiet; then
+          echo "ConfigMap already up-to-date — no commit needed."
+          exit 0
+        fi
+
+        git commit -m "chore: update ${DEPLOY_REPO_NAME} tag to ${LATEST_TAG} in ${CONFIGMAP_NAME}"
+        git push origin "${TARGET_REPO_BRANCH}"
+
+        echo "Successfully pushed tag update to ${TARGET_REPO_URL}"
